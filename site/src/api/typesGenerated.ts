@@ -1894,6 +1894,7 @@ export type Experiment =
 	| "mcp-server-http"
 	| "notifications"
 	| "oauth2"
+	| "terraform-workspaces"
 	| "web-push"
 	| "workspace-sharing"
 	| "workspace-usage";
@@ -1904,6 +1905,7 @@ export const Experiments: Experiment[] = [
 	"mcp-server-http",
 	"notifications",
 	"oauth2",
+	"terraform-workspaces",
 	"web-push",
 	"workspace-sharing",
 	"workspace-usage",
