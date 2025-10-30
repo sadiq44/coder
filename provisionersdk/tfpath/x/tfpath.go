@@ -1,5 +1,8 @@
 package x
 
+// This file will replace the `tfpath.go` in the parent `tfpath` package when the
+// `terraform-workspace` experiment is graduated.
+
 import (
 	"archive/tar"
 	"bytes"
@@ -21,15 +24,18 @@ import (
 	"github.com/coder/coder/v2/provisionersdk/tfpath"
 )
 
-var _ tfpath.LayoutInterface = (*TerraformDirectory)(nil)
+var _ tfpath.LayoutInterface = (*Layout)(nil)
 
-func SessionDir(parentDir, sessID string, config *proto.Config) TerraformDirectory {
-	if config.TemplateId == "" || config.TemplateId == uuid.Nil.String() ||
-		config.TemplateVersionId == "" || config.TemplateVersionId == uuid.Nil.String() {
+func SessionDir(parentDir, sessID string, config *proto.Config) Layout {
+	missingID := config.TemplateId == "" || config.TemplateId == uuid.Nil.String() ||
+		config.TemplateVersionId == "" || config.TemplateVersionId == uuid.Nil.String()
+
+	// Both templateID and templateVersionID must be set to reuse workspace.
+	if !config.TerraformWorkspaceReuse || missingID {
 		return EphemeralSessionDir(parentDir, sessID)
 	}
 
-	return TerraformDirectory{
+	return Layout{
 		workDirectory: filepath.Join(parentDir, config.TemplateId, config.TemplateVersionId),
 		sessionID:     sessID,
 		ephemeral:     false,
@@ -39,15 +45,15 @@ func SessionDir(parentDir, sessID string, config *proto.Config) TerraformDirecto
 // EphemeralSessionDir returns the directory name with mandatory prefix. These
 // directories are created for each provisioning session and are meant to be
 // ephemeral.
-func EphemeralSessionDir(parentDir, sessID string) TerraformDirectory {
-	return TerraformDirectory{
+func EphemeralSessionDir(parentDir, sessID string) Layout {
+	return Layout{
 		workDirectory: filepath.Join(parentDir, sessionDirPrefix+sessID),
 		sessionID:     sessID,
 		ephemeral:     true,
 	}
 }
 
-type TerraformDirectory struct {
+type Layout struct {
 	workDirectory string
 	sessionID     string
 	ephemeral     bool
@@ -60,7 +66,52 @@ const (
 	sessionDirPrefix = "Session"
 )
 
-func (td TerraformDirectory) Cleanup(ctx context.Context, logger slog.Logger, fs afero.Fs) {
+func (td Layout) WorkDirectory() string {
+	return td.workDirectory
+}
+
+// StateSessionDirectory follows the same directory structure as Terraform
+// workspaces. All build specific state is stored within this directory.
+//
+// These files should be cleaned up on exit. In the case of a failure, they will
+// not collide with other builds since each build uses a unique session ID.
+func (td Layout) StateSessionDirectory() string {
+	return filepath.Join(td.workDirectory, "terraform.tfstate.d", td.sessionID)
+}
+
+func (td Layout) StateFilePath() string {
+	return filepath.Join(td.StateSessionDirectory(), "terraform.tfstate")
+}
+
+func (td Layout) PlanFilePath() string {
+	return filepath.Join(td.StateSessionDirectory(), "terraform.tfplan")
+}
+
+func (td Layout) TerraformLockFile() string {
+	return filepath.Join(td.WorkDirectory(), ".terraform.lock.hcl")
+}
+
+func (td Layout) ReadmeFilePath() string {
+	return filepath.Join(td.WorkDirectory(), ReadmeFile)
+}
+
+func (td Layout) TerraformMetadataDir() string {
+	return filepath.Join(td.WorkDirectory(), ".terraform")
+}
+
+func (td Layout) ModulesDirectory() string {
+	return filepath.Join(td.TerraformMetadataDir(), "modules")
+}
+
+func (td Layout) ModulesFilePath() string {
+	return filepath.Join(td.ModulesDirectory(), "modules.json")
+}
+
+func (td Layout) WorkspaceEnvironmentFilePath() string {
+	return filepath.Join(td.TerraformMetadataDir(), "environment")
+}
+
+func (td Layout) Cleanup(ctx context.Context, logger slog.Logger, fs afero.Fs) {
 	var err error
 	path := td.WorkDirectory()
 	if !td.ephemeral {
@@ -80,58 +131,15 @@ func (td TerraformDirectory) Cleanup(ctx context.Context, logger slog.Logger, fs
 			time.Sleep(250 * time.Millisecond)
 			continue
 		}
-		logger.Debug(ctx, "cleaned up work directory")
+		logger.Debug(ctx, "cleaned up work directory", slog.F("path", path))
 		return
 	}
 
 	logger.Error(ctx, "failed to clean up work directory after multiple attempts",
 		slog.F("path", path), slog.Error(err))
-
-	return
 }
 
-func (td TerraformDirectory) WorkDirectory() string {
-	return td.workDirectory
-}
-
-// StateSessionDirectory follows the same directory structure as Terraform
-// workspaces. All build specific state is stored within this directory.
-//
-// These files should be cleaned up on exit. In the case of a failure, they will
-// not collide with other builds since each build uses a unique session ID.
-func (td TerraformDirectory) StateSessionDirectory() string {
-	return filepath.Join(td.workDirectory, "terraform.tfstate.d", td.sessionID)
-}
-
-func (td TerraformDirectory) StateFilePath() string {
-	return filepath.Join(td.StateSessionDirectory(), "terraform.tfstate")
-}
-
-func (td TerraformDirectory) PlanFilePath() string {
-	return filepath.Join(td.StateSessionDirectory(), "terraform.tfplan")
-}
-
-func (td TerraformDirectory) TerraformLockFile() string {
-	return filepath.Join(td.WorkDirectory(), ".terraform.lock.hcl")
-}
-
-func (td TerraformDirectory) ReadmeFilePath() string {
-	return filepath.Join(td.WorkDirectory(), ReadmeFile)
-}
-
-func (td TerraformDirectory) TerraformMetadataDir() string {
-	return filepath.Join(td.WorkDirectory(), ".terraform")
-}
-
-func (td TerraformDirectory) ModulesDirectory() string {
-	return filepath.Join(td.TerraformMetadataDir(), "modules")
-}
-
-func (td TerraformDirectory) ModulesFilePath() string {
-	return filepath.Join(td.ModulesDirectory(), "modules.json")
-}
-
-func (td TerraformDirectory) ExtractArchive(ctx context.Context, logger slog.Logger, fs afero.Fs, cfg *proto.Config) error {
+func (td Layout) ExtractArchive(ctx context.Context, logger slog.Logger, fs afero.Fs, cfg *proto.Config) error {
 	logger.Info(ctx, "unpacking template source archive",
 		slog.F("size_bytes", len(cfg.TemplateSourceArchive)),
 	)
@@ -139,6 +147,19 @@ func (td TerraformDirectory) ExtractArchive(ctx context.Context, logger slog.Log
 	err := fs.MkdirAll(td.WorkDirectory(), 0o700)
 	if err != nil {
 		return xerrors.Errorf("create work directory %q: %w", td.WorkDirectory(), err)
+	}
+
+	err = fs.MkdirAll(td.StateSessionDirectory(), 0o700)
+	if err != nil {
+		return xerrors.Errorf("create state directory %q: %w", td.WorkDirectory(), err)
+	}
+
+	// TODO: This is a bit hacky. We should use `terraform workspace select` to create this
+	//   environment file. However, since we know the backend is `local`, this is a quicker
+	//   way to accomplish the same thing.
+	err = td.SelectWorkspace(fs)
+	if err != nil {
+		return xerrors.Errorf("select terraform workspace: %w", err)
 	}
 
 	reader := tar.NewReader(bytes.NewBuffer(cfg.TemplateSourceArchive))
@@ -192,7 +213,7 @@ func (td TerraformDirectory) ExtractArchive(ctx context.Context, logger slog.Log
 		case tar.TypeReg:
 			// TODO: If we are overwriting an existing file, that means we are reusing
 			//  the terraform directory. In that case, we should check the file content
-			//  matches what already exists on disk.
+			//  matches what already exists on disk. Or just continue to overwrite it.
 			file, err := fs.OpenFile(headerPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, mode)
 			if err != nil {
 				return xerrors.Errorf("create file %q (mode %s): %w", headerPath, mode, err)
@@ -224,35 +245,75 @@ func (td TerraformDirectory) ExtractArchive(ctx context.Context, logger slog.Log
 	return nil
 }
 
-// CleanInactiveTemplateVersions assumes this TerraformDirectory is the latest
-// active template version. Assuming that, any other template version directories
-// found alongside it are considered inactive and can be removed. Inactive
-// template versions should use ephemeral TerraformDirectories.
-func (td TerraformDirectory) CleanInactiveTemplateVersions(ctx context.Context, logger slog.Logger, fs afero.Fs) error {
+// CleanStaleSessions assumes this Layout is the latest active template version.
+// Assuming that, any other template version directories found alongside it are
+// considered inactive and can be removed. Inactive template versions should use
+// ephemeral TerraformDirectories.
+func (td Layout) CleanStaleSessions(ctx context.Context, logger slog.Logger, fs afero.Fs, now time.Time) error {
 	if td.ephemeral {
-		return nil
+		// Use the existing cleanup for ephemeral sessions.
+		return tfpath.FromWorkingDirectory(td.workDirectory).CleanStaleSessions(ctx, logger, fs, now)
 	}
 
+	// All template versions share the same parent directory. Since only the latest
+	// active version should remain, remove all other version directories.
 	wd := td.WorkDirectory()
 	templateDir := filepath.Dir(wd)
 	versionDir := filepath.Base(wd)
 
 	entries, err := afero.ReadDir(fs, templateDir)
+	if xerrors.Is(err, os.ErrNotExist) {
+		// Nothing to clean, this template dir does not exist.
+		return nil
+	}
 	if err != nil {
 		return xerrors.Errorf("can't read %q directory: %w", templateDir, err)
 	}
 
 	for _, fi := range entries {
-		if fi.IsDir() && fi.Name() == versionDir {
+		if !fi.IsDir() {
 			continue
 		}
 
-		oldVerDir := filepath.Join(wd, fi.Name())
+		if fi.Name() == versionDir {
+			continue
+		}
+
+		// Note: There is a .coder directory here with a pprof unix file.
+		// This is from the previous provisioner run, and will be removed here.
+		// TODO: Add more explicit pprof cleanup/handling.
+
+		oldVerDir := filepath.Join(templateDir, fi.Name())
 		logger.Info(ctx, "remove inactive template version directory", slog.F("version_path", oldVerDir))
 		err = fs.RemoveAll(oldVerDir)
 		if err != nil {
 			return xerrors.Errorf("can't remove inactive template version %q: %w", fi.Name(), err)
 		}
+	}
+	return nil
+}
+
+// SelectWorkspace writes the terraform workspace environment file, which acts as
+// `terraform workspace select <name>`. It is quicker than using the cli command.
+// More importantly this code can be written without changing the executor
+// behavior, which is nice encapsulation for this experiment.
+func (td Layout) SelectWorkspace(fs afero.Fs) error {
+	// Also set up the terraform workspace to use
+	err := fs.MkdirAll(td.TerraformMetadataDir(), 0o700)
+	if err != nil {
+		return xerrors.Errorf("create terraform metadata directory %q: %w", td.TerraformMetadataDir(), err)
+	}
+
+	file, err := fs.OpenFile(td.WorkspaceEnvironmentFilePath(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return xerrors.Errorf("create workspace environment file: %w", err)
+	}
+	defer file.Close()
+
+	_, err = file.WriteString(td.sessionID)
+	if err != nil {
+		_ = file.Close()
+		return xerrors.Errorf("write workspace environment file: %w", err)
 	}
 	return nil
 }
