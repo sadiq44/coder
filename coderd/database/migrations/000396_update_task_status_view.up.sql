@@ -11,6 +11,8 @@ AS
 
 			WHEN latest_build.job_status = 'failed' THEN 'error'::task_status
 
+			WHEN latest_build.job_status IN ('canceling', 'canceled') THEN 'error'::task_status
+
 			WHEN latest_build.transition IN ('stop', 'delete')
 				AND latest_build.job_status = 'succeeded' THEN 'paused'::task_status
 
@@ -19,18 +21,23 @@ AS
 
 			WHEN latest_build.transition = 'start' AND latest_build.job_status IN ('running', 'succeeded') THEN
 				CASE
-					WHEN agent_status.none THEN 'initializing'::task_status
-					WHEN agent_status.connecting THEN 'initializing'::task_status
-					WHEN agent_status.connected THEN
+					WHEN agent_status.none OR agent_status.connecting THEN 'initializing'::task_status
+					-- If the agent is shut down, but the workspace isn't
+					-- stopped, show as error.
+					WHEN agent_status.shutdown THEN 'error'::task_status
+					-- Start failed also means connected, but we don't
+					-- necessarily want to surface an error.
+					WHEN agent_status.connected OR agent_status.connected_start_failed THEN
 						CASE
-							WHEN app_status.any_unhealthy THEN 'error'::task_status
-							WHEN app_status.any_initializing THEN 'initializing'::task_status
-							WHEN app_status.all_healthy_or_disabled THEN 'active'::task_status
+							WHEN app_status.unhealthy THEN 'error'::task_status
+							WHEN app_status.initializing THEN 'initializing'::task_status
+							WHEN app_status.healthy_or_disabled THEN 'active'::task_status
+							-- Fall back to surfacing error in case the app isn't healthy.
+							WHEN agent_status.connected_start_failed THEN 'error'::task_status
 							ELSE 'unknown'::task_status
 						END
 					ELSE 'unknown'::task_status
 				END
-
 			ELSE 'unknown'::task_status
 		END AS status,
 		task_app.*,
@@ -62,21 +69,25 @@ AS
 		WHERE workspace_build.workspace_id = tasks.workspace_id
 			AND workspace_build.build_number = task_app.workspace_build_number
 	) latest_build ON TRUE
-	CROSS JOIN LATERAL (
+	LEFT JOIN LATERAL (
 		SELECT
-			COUNT(*) = 0 AS none,
-			bool_or(workspace_agent.lifecycle_state IN ('created', 'starting')) AS connecting,
-			bool_and(workspace_agent.lifecycle_state = 'ready') AS connected
+			workspace_agent.id IS NULL AS none,
+			-- This is essentially `IN ('shutting_down', 'shutdown_timeout', 'shutdown_error', 'off')`,
+			-- but we cannot use it because the values were added in a migration.
+			COALESCE(workspace_agent.lifecycle_state NOT IN ('created', 'starting', 'start_timeout', 'start_error', 'ready'), false) AS shutdown,
+			COALESCE(workspace_agent.lifecycle_state IN ('created', 'starting'), false) AS connecting,
+			COALESCE(workspace_agent.lifecycle_state IN ('start_timeout', 'start_error'), false) AS connected_start_failed,
+			COALESCE(workspace_agent.lifecycle_state = 'ready', false) AS connected
 		FROM workspace_agents workspace_agent
 		WHERE workspace_agent.id = task_app.workspace_agent_id
-	) agent_status
-	CROSS JOIN LATERAL (
+	) agent_status ON TRUE
+	LEFT JOIN LATERAL (
 		SELECT
-			bool_or(workspace_app.health = 'unhealthy') AS any_unhealthy,
-			bool_or(workspace_app.health = 'initializing') AS any_initializing,
-			bool_and(workspace_app.health IN ('healthy', 'disabled')) AS all_healthy_or_disabled
+			COALESCE(workspace_app.health = 'unhealthy', false) AS unhealthy,
+			COALESCE(workspace_app.health = 'initializing', false) AS initializing,
+			COALESCE(workspace_app.health IN ('healthy', 'disabled'), false) AS healthy_or_disabled
 		FROM workspace_apps workspace_app
 		WHERE workspace_app.id = task_app.workspace_app_id
-	) app_status
+	) app_status ON TRUE
 	WHERE
 		tasks.deleted_at IS NULL;
