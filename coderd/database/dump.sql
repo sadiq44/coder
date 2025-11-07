@@ -1966,17 +1966,20 @@ CREATE VIEW tasks_with_status AS
         CASE
             WHEN ((tasks.workspace_id IS NULL) OR (latest_build.job_status IS NULL)) THEN 'pending'::task_status
             WHEN (latest_build.job_status = 'failed'::provisioner_job_status) THEN 'error'::task_status
+            WHEN (latest_build.job_status = ANY (ARRAY['canceling'::provisioner_job_status, 'canceled'::provisioner_job_status])) THEN 'error'::task_status
             WHEN ((latest_build.transition = ANY (ARRAY['stop'::workspace_transition, 'delete'::workspace_transition])) AND (latest_build.job_status = 'succeeded'::provisioner_job_status)) THEN 'paused'::task_status
             WHEN ((latest_build.transition = 'start'::workspace_transition) AND (latest_build.job_status = 'pending'::provisioner_job_status)) THEN 'initializing'::task_status
             WHEN ((latest_build.transition = 'start'::workspace_transition) AND (latest_build.job_status = ANY (ARRAY['running'::provisioner_job_status, 'succeeded'::provisioner_job_status]))) THEN
             CASE
                 WHEN agent_status."none" THEN 'initializing'::task_status
                 WHEN agent_status.connecting THEN 'initializing'::task_status
-                WHEN agent_status.connected THEN
+                WHEN agent_status.shutdown THEN 'error'::task_status
+                WHEN (agent_status.connected OR agent_status.connected_start_failed) THEN
                 CASE
-                    WHEN app_status.any_unhealthy THEN 'error'::task_status
-                    WHEN app_status.any_initializing THEN 'initializing'::task_status
-                    WHEN app_status.all_healthy_or_disabled THEN 'active'::task_status
+                    WHEN app_status.unhealthy THEN 'error'::task_status
+                    WHEN app_status.initializing THEN 'initializing'::task_status
+                    WHEN app_status.healthy_or_disabled THEN 'active'::task_status
+                    WHEN agent_status.connected_start_failed THEN 'error'::task_status
                     ELSE 'unknown'::task_status
                 END
                 ELSE 'unknown'::task_status
@@ -2008,16 +2011,18 @@ CREATE VIEW tasks_with_status AS
            FROM (workspace_builds workspace_build
              JOIN provisioner_jobs provisioner_job ON ((provisioner_job.id = workspace_build.job_id)))
           WHERE ((workspace_build.workspace_id = tasks.workspace_id) AND (workspace_build.build_number = task_app.workspace_build_number))) latest_build ON (true))
-     CROSS JOIN LATERAL ( SELECT (count(*) = 0) AS "none",
-            bool_or((workspace_agent.lifecycle_state = ANY (ARRAY['created'::workspace_agent_lifecycle_state, 'starting'::workspace_agent_lifecycle_state]))) AS connecting,
-            bool_and((workspace_agent.lifecycle_state = 'ready'::workspace_agent_lifecycle_state)) AS connected
+     LEFT JOIN LATERAL ( SELECT (workspace_agent.id IS NULL) AS "none",
+            COALESCE((workspace_agent.lifecycle_state <> ALL (ARRAY['created'::workspace_agent_lifecycle_state, 'starting'::workspace_agent_lifecycle_state, 'start_timeout'::workspace_agent_lifecycle_state, 'start_error'::workspace_agent_lifecycle_state, 'ready'::workspace_agent_lifecycle_state])), false) AS shutdown,
+            COALESCE((workspace_agent.lifecycle_state = ANY (ARRAY['created'::workspace_agent_lifecycle_state, 'starting'::workspace_agent_lifecycle_state])), false) AS connecting,
+            COALESCE((workspace_agent.lifecycle_state = ANY (ARRAY['start_timeout'::workspace_agent_lifecycle_state, 'start_error'::workspace_agent_lifecycle_state])), false) AS connected_start_failed,
+            COALESCE((workspace_agent.lifecycle_state = 'ready'::workspace_agent_lifecycle_state), false) AS connected
            FROM workspace_agents workspace_agent
-          WHERE (workspace_agent.id = task_app.workspace_agent_id)) agent_status)
-     CROSS JOIN LATERAL ( SELECT bool_or((workspace_app.health = 'unhealthy'::workspace_app_health)) AS any_unhealthy,
-            bool_or((workspace_app.health = 'initializing'::workspace_app_health)) AS any_initializing,
-            bool_and((workspace_app.health = ANY (ARRAY['healthy'::workspace_app_health, 'disabled'::workspace_app_health]))) AS all_healthy_or_disabled
+          WHERE (workspace_agent.id = task_app.workspace_agent_id)) agent_status ON (true))
+     LEFT JOIN LATERAL ( SELECT COALESCE((workspace_app.health = 'unhealthy'::workspace_app_health), false) AS unhealthy,
+            COALESCE((workspace_app.health = 'initializing'::workspace_app_health), false) AS initializing,
+            COALESCE((workspace_app.health = ANY (ARRAY['healthy'::workspace_app_health, 'disabled'::workspace_app_health])), false) AS healthy_or_disabled
            FROM workspace_apps workspace_app
-          WHERE (workspace_app.id = task_app.workspace_app_id)) app_status)
+          WHERE (workspace_app.id = task_app.workspace_app_id)) app_status ON (true))
   WHERE (tasks.deleted_at IS NULL);
 
 CREATE TABLE telemetry_items (
