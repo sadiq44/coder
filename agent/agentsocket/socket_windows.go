@@ -11,12 +11,17 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/hashicorp/yamux"
+	"golang.org/x/xerrors"
+
 	"cdr.dev/slog"
+	"github.com/coder/coder/v2/agent/agentsocket/proto"
+	"github.com/coder/coder/v2/codersdk/drpcsdk"
 )
 
 // createSocket creates a Unix domain socket listener on Windows
 // Falls back to named pipe if Unix sockets are not supported
-func CreateSocket(path string) (net.Listener, error) {
+func createSocket(path string) (net.Listener, error) {
 	// Try Unix domain socket first (Windows 10 build 17063+)
 	listener, err := net.Listen("unix", path)
 	if err == nil {
@@ -33,7 +38,7 @@ func CreateSocket(path string) (net.Listener, error) {
 }
 
 // getDefaultSocketPath returns the default socket path for Windows
-func GetDefaultSocketPath() (string, error) {
+func getDefaultSocketPath() (string, error) {
 	// Try to use a temporary directory
 	tempDir := os.TempDir()
 	if tempDir == "" {
@@ -52,30 +57,26 @@ func GetDefaultSocketPath() (string, error) {
 }
 
 // cleanupSocket removes the socket file
-func CleanupSocket(path string) error {
+func cleanupSocket(path string) error {
 	return os.Remove(path)
 }
 
 // isSocketAvailable checks if a socket path is available for use
-func IsSocketAvailable(path string, logger slog.Logger) bool {
-	logger.Debug(context.Background(), "Checking socket availability on Windows", slog.F("path", path))
-
+func isSocketAvailable(path string) bool {
 	// Check if file exists
 	if _, err := os.Stat(path); os.IsNotExist(err) {
-		logger.Debug(context.Background(), "Socket file does not exist, path is available", slog.F("path", path))
 		return true
 	}
-	logger.Debug(context.Background(), "Socket file exists, checking if it's listening", slog.F("path", path))
 
 	// Try to connect to see if it's actually listening
 	conn, err := net.Dial("unix", path)
 	if err != nil {
 		// If we can't connect, the socket is not in use
-		logger.Debug(context.Background(), "Cannot connect to socket, path is available", slog.F("path", path), slog.Error(err))
+		// Socket is available for use
 		return true
 	}
 	_ = conn.Close()
-	logger.Debug(context.Background(), "Socket is listening, path is not available", slog.F("path", path))
+	// Socket is in use
 	return false
 }
 
@@ -108,4 +109,26 @@ type SocketInfo struct {
 	ModTime time.Time
 	Owner   string // Windows SID string
 	Group   string // Windows SID string
+}
+
+// NewClient creates a DRPC client for the agent socket at the given path.
+func NewClient(path string, logger slog.Logger) (*Client, error) {
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		return nil, xerrors.Errorf("dial unix socket: %w", err)
+	}
+
+	config := yamux.DefaultConfig()
+	config.LogOutput = nil
+	config.Logger = slog.Stdlib(context.Background(), logger, slog.LevelInfo)
+	session, err := yamux.Client(conn, config)
+	if err != nil {
+		_ = conn.Close()
+		return nil, xerrors.Errorf("multiplex client: %w", err)
+	}
+	return &Client{
+		DRPCAgentSocketClient: proto.NewDRPCAgentSocketClient(drpcsdk.MultiplexedConn(session)),
+		conn:                  conn,
+		session:               session,
+	}, nil
 }

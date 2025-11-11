@@ -3,7 +3,6 @@ package agentsocket
 import (
 	"context"
 	"errors"
-	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -16,7 +15,6 @@ import (
 var _ proto.DRPCAgentSocketServer = (*DRPCAgentSocketService)(nil)
 
 type DRPCAgentSocketService struct {
-	mu          sync.RWMutex
 	unitManager *unit.Manager[string, string]
 	logger      slog.Logger
 }
@@ -61,17 +59,23 @@ func (s *DRPCAgentSocketService) SyncStart(_ context.Context, req *proto.SyncSta
 		}, nil
 	}
 	if !isReady {
+		return nil, errors.New("Unit is not ready")
+	}
+
+	// Check if unit is already started
+	currentStatus, err := s.unitManager.GetStatus(req.Unit)
+	if err != nil && !errors.Is(err, unit.ErrConsumerNotFound) {
 		return &proto.SyncStartResponse{
 			Success: false,
-			Message: "Unit is not ready",
+			Message: "Failed to get unit status: " + err.Error(),
 		}, nil
+	}
+	if currentStatus == unit.StatusStarted {
+		return nil, unit.ErrSameStatusAlreadySet
 	}
 
 	if err := s.unitManager.UpdateStatus(req.Unit, unit.StatusStarted); err != nil {
-		return &proto.SyncStartResponse{
-			Success: false,
-			Message: "Failed to update status: " + err.Error(),
-		}, nil
+		return nil, err
 	}
 
 	return &proto.SyncStartResponse{
